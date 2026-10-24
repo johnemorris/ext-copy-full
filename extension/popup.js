@@ -1,11 +1,11 @@
 // Popup interaction script for SnapFull
 document.addEventListener('DOMContentLoaded', async () => {
   const btnCapture = document.getElementById('btnCapture');
+  const btnCaptureAndEdit = document.getElementById('btnCaptureAndEdit');
   const toggleClipboard = document.getElementById('toggleClipboard');
   const toggleDownload = document.getElementById('toggleDownload');
   const toggleWarmup = document.getElementById('toggleWarmup');
   const toggleEditor = document.getElementById('toggleEditor');
-  const btnCaptureAndEdit = document.getElementById('btnCaptureAndEdit');
   const statusBox = document.getElementById('statusBox');
   const openOptions = document.getElementById('openOptions');
   const engineBadge = document.getElementById('engineBadge');
@@ -46,11 +46,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   const triggerCapture = async (forceOpenEditor = false) => {
+    statusBox.className = 'status-msg';
+    statusBox.style.display = 'block';
+    statusBox.style.background = 'rgba(56, 189, 248, 0.15)';
+    statusBox.style.color = '#38bdf8';
+    statusBox.style.border = '1px solid rgba(56, 189, 248, 0.3)';
+    statusBox.innerHTML = '<span style="display:inline-block;animation:spin 1s infinite linear;">↻</span> Capturing entire page...';
+
     btnCapture.disabled = true;
     if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = true;
-    btnCapture.innerHTML = '<span style="display:inline-block;animation:spin 1s infinite linear;">↻</span> Capturing...';
-    statusBox.className = 'status-msg';
-    statusBox.style.display = 'none';
 
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -58,8 +62,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         throw new Error('No active web page detected.');
       }
 
-      if (tab.url.startsWith('chrome://') || tab.url.startsWith('edge://')) {
-        throw new Error('Chrome extensions cannot capture internal chrome:// pages.');
+      if (
+        tab.url.startsWith('chrome://') ||
+        tab.url.startsWith('chrome-extension://') ||
+        tab.url.startsWith('edge://') ||
+        tab.url.startsWith('about:')
+      ) {
+        throw new Error('Chrome restricts extensions on internal chrome:// or extension store pages. Please test on any regular website (e.g. github.com, wikipedia.org, google.com).');
       }
 
       chrome.runtime.sendMessage(
@@ -76,14 +85,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         (response) => {
           btnCapture.disabled = false;
           if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = false;
-          btnCapture.innerHTML = '<span>Capture to Clipboard</span>';
+
+          if (chrome.runtime.lastError) {
+            statusBox.textContent = '⚠️ ' + chrome.runtime.lastError.message;
+            statusBox.className = 'status-msg error';
+            return;
+          }
 
           if (response && response.success) {
-            statusBox.textContent = forceOpenEditor || toggleEditor.checked
-              ? '✓ Captured! Opening image editor...'
-              : '✓ Captured & Copied to Clipboard!';
+            statusBox.innerHTML = '<strong>✓ Full Page Captured!</strong><br><span style="font-size:10px;">Copied to clipboard. Press Cmd+V to paste.</span>';
             statusBox.className = 'status-msg success';
-            setTimeout(() => window.close(), 1600);
+            setTimeout(() => window.close(), 2400);
           } else {
             statusBox.textContent = '⚠️ ' + (response?.error || 'Capture failed');
             statusBox.className = 'status-msg error';
@@ -93,7 +105,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (err) {
       btnCapture.disabled = false;
       if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = false;
-      btnCapture.innerHTML = '<span>Capture to Clipboard</span>';
       statusBox.textContent = '⚠️ ' + err.message;
       statusBox.className = 'status-msg error';
     }

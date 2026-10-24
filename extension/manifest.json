@@ -1,14 +1,19 @@
 {
   "manifest_version": 3,
   "name": "SnapFull - Full Page Capture to Clipboard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "DevTools-style full-page screenshot tool that automatically copies to clipboard, with optional file saving, lazy-scroll warmup, and built-in editor.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
     "downloads",
-    "debugger"
+    "debugger",
+    "clipboardWrite",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
   ],
   "action": {
     "default_popup": "popup.html",

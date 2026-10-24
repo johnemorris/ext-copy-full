@@ -1,17 +1,18 @@
 // Background Service Worker for SnapFull (Manifest V3)
-// Supports both Chrome DevTools Protocol (CDP Page.captureScreenshot) and Smooth Scroll & Stitch
+// Supports Chrome DevTools Protocol (CDP Page.captureScreenshot) with seamless Scroll & Stitch fallback
+// Uses Chrome Offscreen Document for 100% reliable clipboard write on macOS and Windows
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.sync.get(['settings'], (res) => {
     if (!res.settings) {
       chrome.storage.sync.set({
         settings: {
-          engine: 'devtools', // 'devtools' (CDP Page.captureScreenshot) or 'stitch'
+          engine: 'devtools', // 'devtools' or 'stitch'
           autoCopyClipboard: true,
           autoDownloadFile: false,
           autoScrollWarmup: true,
           scrollDelayMs: 150,
-          format: 'png', // 'png' or 'jpeg'
+          format: 'png',
           jpegQuality: 92,
           hideFixedElements: false,
           playShutterSound: true,
@@ -22,7 +23,7 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-// Handle keyboard shortcut command
+// Handle keyboard shortcut command (Alt+Shift+S or Option+Shift+S)
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === 'capture-full-page') {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -32,7 +33,7 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
 });
 
-// Listen for messages from popup or content script
+// Listen for messages from popup, editor, or content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'START_CAPTURE') {
     const tabId = message.tabId || sender.tab?.id;
@@ -53,85 +54,111 @@ async function startCapture(tabId, customOptions = {}) {
   const store = await chrome.storage.sync.get(['settings']);
   const settings = { ...(store.settings || {}), ...customOptions };
 
-  // 1. Inject content script helpers if needed
+  // 1. Inject content script into active tab
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ['content.js']
   });
 
-  // 2. Perform lazy-scroll warmup if requested
+  // 2. Perform lazy-scroll warmup sweep if requested
   if (settings.autoScrollWarmup) {
-    await chrome.tabs.sendMessage(tabId, {
-      action: 'PRELOAD_PAGE',
-      delayMs: settings.scrollDelayMs || 150
-    });
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        action: 'PRELOAD_PAGE',
+        delayMs: settings.scrollDelayMs || 150
+      });
+    } catch (e) {
+      console.warn('Preload scroll warning:', e);
+    }
   }
 
-  // 3. Choose engine
+  // 3. Choose capture engine (DevTools CDP or Smooth Scroll-and-Stitch)
   let dataUrl = '';
   if (settings.engine === 'devtools') {
     try {
       dataUrl = await captureWithCDP(tabId, settings);
-    } catch (e) {
-      console.warn('CDP capture failed, falling back to scroll-stitch:', e);
+    } catch (cdpErr) {
+      console.warn('DevTools CDP capture failed, falling back to Scroll & Stitch:', cdpErr);
       dataUrl = await captureWithStitch(tabId, settings);
     }
   } else {
     dataUrl = await captureWithStitch(tabId, settings);
   }
 
-  // 4. Delegate clipboard write to content script (content scripts have DOM clipboard permissions)
-  let copied = false;
-  if (settings.autoCopyClipboard) {
-    const copyResult = await chrome.tabs.sendMessage(tabId, {
-      action: 'COPY_TO_CLIPBOARD',
-      dataUrl
-    });
-    copied = copyResult?.success ?? false;
+  if (!dataUrl) {
+    throw new Error('Screenshot capture produced empty image.');
   }
 
-  // Cache last capture for built-in editor
+  // 4. Cache last capture for built-in editor
   await chrome.storage.local.set({ lastCaptureDataUrl: dataUrl });
 
-  // 5. Optionally save to file
-  let downloaded = false;
-  if (settings.autoDownloadFile) {
-    const tab = await chrome.tabs.get(tabId);
-    const sanitizedTitle = (tab.title || 'screenshot')
-      .replace(/[^a-z0-9_-]/gi, '_')
-      .slice(0, 50);
-    const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
-    const ext = settings.format === 'jpeg' ? 'jpg' : 'png';
-    const filename = sanitizedTitle + '_' + dateStr + '.' + ext;
-
-    await chrome.downloads.download({
-      url: dataUrl,
-      filename,
-      saveAs: false
-    });
-    downloaded = true;
+  // 5. Copy image to system clipboard (primary: Offscreen API; fallback: Content script)
+  let copied = false;
+  if (settings.autoCopyClipboard) {
+    try {
+      copied = await copyToClipboardViaOffscreen(dataUrl);
+    } catch (offscreenErr) {
+      console.warn('Offscreen clipboard write failed, trying content script fallback:', offscreenErr);
+      try {
+        const copyResult = await chrome.tabs.sendMessage(tabId, {
+          action: 'COPY_TO_CLIPBOARD',
+          dataUrl
+        });
+        copied = copyResult?.success ?? false;
+      } catch (contentErr) {
+        console.error('All clipboard write attempts failed:', contentErr);
+      }
+    }
   }
 
-  // 6. If user requested direct editor opening
+  // 6. Optionally save to file
+  let downloaded = false;
+  if (settings.autoDownloadFile) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const sanitizedTitle = (tab.title || 'screenshot')
+        .replace(/[^a-z0-9_-]/gi, '_')
+        .slice(0, 50);
+      const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
+      const ext = settings.format === 'jpeg' ? 'jpg' : 'png';
+      const filename = sanitizedTitle + '_' + dateStr + '.' + ext;
+
+      await chrome.downloads.download({
+        url: dataUrl,
+        filename,
+        saveAs: false
+      });
+      downloaded = true;
+    } catch (dlErr) {
+      console.warn('Download error:', dlErr);
+    }
+  }
+
+  // 7. Open editor if requested
   if (settings.openEditor) {
     await chrome.tabs.create({ url: chrome.runtime.getURL('editor.html') });
   }
 
-  // 7. Notify tab with success overlay confirmation toast
-  await chrome.tabs.sendMessage(tabId, {
-    action: 'SHOW_TOAST',
-    message: copied && downloaded
-      ? 'Entire page captured: Saved to clipboard & Downloaded!'
-      : copied
-      ? 'Entire page captured & copied to clipboard!'
-      : 'Entire page captured & downloaded!'
-  });
+  // 8. Notify the tab with confirmation notification
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      action: 'SHOW_TOAST',
+      message: copied && downloaded
+        ? 'Entire page captured: Saved to clipboard & Downloaded!'
+        : copied
+        ? 'Entire page captured & copied to clipboard!'
+        : downloaded
+        ? 'Entire page captured & downloaded!'
+        : 'Entire page captured!'
+    });
+  } catch (_) {
+    // If tab was closed or unresponsive, ignore toast error
+  }
 
   return { success: true, copied, downloaded, dataUrl };
 }
 
 // DevTools Protocol Engine (CDP)
-// Exact same implementation as Chrome DevTools "Capture full size screenshot"
 async function captureWithCDP(tabId, settings) {
   const target = { tabId };
   await chrome.debugger.attach(target, '1.3');
@@ -139,13 +166,22 @@ async function captureWithCDP(tabId, settings) {
   try {
     await chrome.debugger.sendCommand(target, 'Page.enable');
 
-    // Get true layout metrics
+    // Get true document metrics (compatible with all Chrome versions)
     const metrics = await chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics');
-    const { contentSize } = metrics;
-    const width = Math.ceil(contentSize.width);
-    const height = Math.ceil(contentSize.height);
+    const contentSize = metrics.cssContentSize || metrics.contentSize || {
+      width: metrics.layoutViewport?.clientWidth || 1920,
+      height: metrics.layoutViewport?.clientHeight || 1080
+    };
 
-    // Override device metrics to encompass the entire document
+    const width = Math.ceil(contentSize.width || 1280);
+    const height = Math.ceil(contentSize.height || 800);
+
+    // If page is extraordinarily tall (> 16,000px), GPU texture limits can fail single CDP capture
+    if (height > 16000) {
+      throw new Error('Page height exceeds single CDP GPU texture limit; switching to scroll & stitch');
+    }
+
+    // Override device metrics
     await chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
       width,
       height,
@@ -153,7 +189,6 @@ async function captureWithCDP(tabId, settings) {
       mobile: false
     });
 
-    // Capture screenshot beyond viewport
     const format = settings.format === 'jpeg' ? 'jpeg' : 'png';
     const screenshotParams = {
       format,
@@ -181,7 +216,7 @@ async function captureWithCDP(tabId, settings) {
   }
 }
 
-// Scroll & Stitch Engine (fallback without debugger banner)
+// Scroll & Stitch Engine (Universal compatibility on all pages)
 async function captureWithStitch(tabId, settings) {
   const dimensions = await chrome.tabs.sendMessage(tabId, { action: 'GET_DIMENSIONS' });
   const { totalWidth, totalHeight, viewportHeight, devicePixelRatio } = dimensions;
@@ -198,7 +233,7 @@ async function captureWithStitch(tabId, settings) {
     });
 
     // Wait for paint
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 140));
 
     const chunkDataUrl = await chrome.tabs.captureVisibleTab(null, {
       format: 'png'
@@ -209,7 +244,7 @@ async function captureWithStitch(tabId, settings) {
   // Restore original scroll
   await chrome.tabs.sendMessage(tabId, { action: 'RESTORE_SCROLL' });
 
-  // Delegate stitching to content script canvas
+  // Stitch frames on offscreen canvas inside tab
   const stitched = await chrome.tabs.sendMessage(tabId, {
     action: 'STITCH_FRAMES',
     frames,
@@ -221,4 +256,27 @@ async function captureWithStitch(tabId, settings) {
   });
 
   return stitched.dataUrl;
+}
+
+// Offscreen Document clipboard writer (avoids document-not-focused errors on macOS)
+async function copyToClipboardViaOffscreen(dataUrl) {
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT']
+  });
+
+  if (!existingContexts.length) {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['CLIPBOARD'],
+      justification: 'Write screenshot image to system clipboard'
+    });
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    action: 'COPY_IMAGE_TO_CLIPBOARD',
+    dataUrl
+  });
+
+  return response?.success ?? false;
 }

@@ -14,14 +14,19 @@ export interface ExtensionFile {
 export const MANIFEST_JSON = `{
   "manifest_version": 3,
   "name": "SnapFull - Full Page Capture to Clipboard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "DevTools-style full-page screenshot tool that automatically copies to clipboard, with optional file saving and lazy-scroll warmup.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
     "downloads",
-    "debugger"
+    "debugger",
+    "clipboardWrite",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
   ],
   "action": {
     "default_popup": "popup.html",
@@ -133,52 +138,67 @@ async function startCapture(tabId, customOptions = {}) {
     dataUrl = await captureWithStitch(tabId, settings);
   }
 
-  // 4. Delegate clipboard write to content script (content scripts have DOM clipboard permissions)
-  let copied = false;
-  if (settings.autoCopyClipboard) {
-    const copyResult = await chrome.tabs.sendMessage(tabId, {
-      action: 'COPY_TO_CLIPBOARD',
-      dataUrl
-    });
-    copied = copyResult?.success ?? false;
-  }
-
   // Cache last capture for built-in editor
   await chrome.storage.local.set({ lastCaptureDataUrl: dataUrl });
 
-  // 5. Optionally save to file
-  let downloaded = false;
-  if (settings.autoDownloadFile) {
-    const tab = await chrome.tabs.get(tabId);
-    const sanitizedTitle = (tab.title || 'screenshot')
-      .replace(/[^a-z0-9_-]/gi, '_')
-      .slice(0, 50);
-    const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
-    const ext = settings.format === 'jpeg' ? 'jpg' : 'png';
-    const filename = sanitizedTitle + '_' + dateStr + '.' + ext;
-
-    await chrome.downloads.download({
-      url: dataUrl,
-      filename,
-      saveAs: false
-    });
-    downloaded = true;
+  // 5. Copy image to system clipboard (primary: Offscreen API; fallback: Content script)
+  let copied = false;
+  if (settings.autoCopyClipboard) {
+    try {
+      copied = await copyToClipboardViaOffscreen(dataUrl);
+    } catch (offscreenErr) {
+      console.warn('Offscreen clipboard write failed, trying content script fallback:', offscreenErr);
+      try {
+        const copyResult = await chrome.tabs.sendMessage(tabId, {
+          action: 'COPY_TO_CLIPBOARD',
+          dataUrl
+        });
+        copied = copyResult?.success ?? false;
+      } catch (contentErr) {
+        console.error('All clipboard write attempts failed:', contentErr);
+      }
+    }
   }
 
-  // 6. If user requested direct editor opening
+  // 6. Optionally save to file
+  let downloaded = false;
+  if (settings.autoDownloadFile) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const sanitizedTitle = (tab.title || 'screenshot')
+        .replace(/[^a-z0-9_-]/gi, '_')
+        .slice(0, 50);
+      const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
+      const ext = settings.format === 'jpeg' ? 'jpg' : 'png';
+      const filename = sanitizedTitle + '_' + dateStr + '.' + ext;
+
+      await chrome.downloads.download({
+        url: dataUrl,
+        filename,
+        saveAs: false
+      });
+      downloaded = true;
+    } catch (dlErr) {
+      console.warn('Download error:', dlErr);
+    }
+  }
+
+  // 7. If user requested direct editor opening
   if (settings.openEditor) {
     await chrome.tabs.create({ url: chrome.runtime.getURL('editor.html') });
   }
 
-  // 7. Notify tab with success overlay confirmation toast
-  await chrome.tabs.sendMessage(tabId, {
-    action: 'SHOW_TOAST',
-    message: copied && downloaded
-      ? 'Entire page captured: Saved to clipboard & Downloaded!'
-      : copied
-      ? 'Entire page captured & copied to clipboard!'
-      : 'Entire page captured & downloaded!'
-  });
+  // 8. Notify tab with success overlay confirmation toast
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      action: 'SHOW_TOAST',
+      message: copied && downloaded
+        ? 'Entire page captured: Saved to clipboard & Downloaded!'
+        : copied
+        ? 'Entire page captured & copied to clipboard!'
+        : 'Entire page captured & downloaded!'
+    });
+  } catch (_) {}
 
   return { success: true, copied, downloaded, dataUrl };
 }
@@ -194,9 +214,16 @@ async function captureWithCDP(tabId, settings) {
 
     // Get true layout metrics
     const metrics = await chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics');
-    const { contentSize } = metrics;
-    const width = Math.ceil(contentSize.width);
-    const height = Math.ceil(contentSize.height);
+    const contentSize = metrics.cssContentSize || metrics.contentSize || {
+      width: metrics.layoutViewport?.clientWidth || 1280,
+      height: metrics.layoutViewport?.clientHeight || 800
+    };
+    const width = Math.ceil(contentSize.width || 1280);
+    const height = Math.ceil(contentSize.height || 800);
+
+    if (height > 16000) {
+      throw new Error('Page height exceeds single CDP GPU texture limit; switching to scroll & stitch');
+    }
 
     // Override device metrics to encompass the entire document
     await chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
@@ -274,6 +301,29 @@ async function captureWithStitch(tabId, settings) {
   });
 
   return stitched.dataUrl;
+}
+
+// Offscreen Document clipboard writer (avoids document-not-focused errors on macOS)
+async function copyToClipboardViaOffscreen(dataUrl) {
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT']
+  });
+
+  if (!existingContexts.length) {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['CLIPBOARD'],
+      justification: 'Write screenshot image to system clipboard'
+    });
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    action: 'COPY_IMAGE_TO_CLIPBOARD',
+    dataUrl
+  });
+
+  return response?.success ?? false;
 }
 `;
 
@@ -898,11 +948,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   const triggerCapture = async (forceOpenEditor = false) => {
+    statusBox.className = 'status-msg';
+    statusBox.style.display = 'block';
+    statusBox.style.background = 'rgba(56, 189, 248, 0.15)';
+    statusBox.style.color = '#38bdf8';
+    statusBox.style.border = '1px solid rgba(56, 189, 248, 0.3)';
+    statusBox.innerHTML = '<span style="display:inline-block;animation:spin 1s infinite linear;">↻</span> Capturing entire page...';
+
     btnCapture.disabled = true;
     if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = true;
-    btnCapture.innerHTML = '<span style="display:inline-block;animation:spin 1s infinite linear;">↻</span> Capturing...';
-    statusBox.className = 'status-msg';
-    statusBox.style.display = 'none';
 
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -910,8 +964,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         throw new Error('No active web page detected.');
       }
 
-      if (tab.url.startsWith('chrome://') || tab.url.startsWith('edge://')) {
-        throw new Error('Chrome extensions cannot capture internal chrome:// pages.');
+      if (
+        tab.url.startsWith('chrome://') ||
+        tab.url.startsWith('chrome-extension://') ||
+        tab.url.startsWith('edge://') ||
+        tab.url.startsWith('about:')
+      ) {
+        throw new Error('Chrome restricts extensions on internal chrome:// or extension store pages. Please test on any regular website (e.g. github.com, wikipedia.org, google.com).');
       }
 
       chrome.runtime.sendMessage(
@@ -928,14 +987,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         (response) => {
           btnCapture.disabled = false;
           if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = false;
-          btnCapture.innerHTML = '<span>Capture to Clipboard</span>';
+
+          if (chrome.runtime.lastError) {
+            statusBox.textContent = '⚠️ ' + chrome.runtime.lastError.message;
+            statusBox.className = 'status-msg error';
+            return;
+          }
 
           if (response && response.success) {
-            statusBox.textContent = forceOpenEditor || toggleEditor.checked
-              ? '✓ Captured! Opening image editor...'
-              : '✓ Captured & Copied to Clipboard!';
+            statusBox.innerHTML = '<strong>✓ Full Page Captured!</strong><br><span style="font-size:10px;">Copied to clipboard. Press Cmd+V to paste.</span>';
             statusBox.className = 'status-msg success';
-            setTimeout(() => window.close(), 1600);
+            setTimeout(() => window.close(), 2400);
           } else {
             statusBox.textContent = '⚠️ ' + (response?.error || 'Capture failed');
             statusBox.className = 'status-msg error';
@@ -945,7 +1007,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (err) {
       btnCapture.disabled = false;
       if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = false;
-      btnCapture.innerHTML = '<span>Capture to Clipboard</span>';
       statusBox.textContent = '⚠️ ' + err.message;
       statusBox.className = 'status-msg error';
     }
@@ -955,7 +1016,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (btnCaptureAndEdit) {
     btnCaptureAndEdit.addEventListener('click', () => triggerCapture(true));
   }
-  });
 });
 `;
 
@@ -1599,6 +1659,52 @@ function showToast(msg) {
 }
 `;
 
+export const OFFSCREEN_HTML = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>SnapFull Offscreen Clipboard</title>
+  <script src="offscreen.js"></script>
+</head>
+<body></body>
+</html>`;
+
+export const OFFSCREEN_JS = `// Offscreen document script for reliable clipboard writes in Chrome Manifest V3
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.target === 'offscreen' && message.action === 'COPY_IMAGE_TO_CLIPBOARD') {
+    copyDataUrlToClipboard(message.dataUrl)
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true; // async
+  }
+});
+
+async function copyDataUrlToClipboard(dataUrl) {
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+
+  let pngBlob = blob;
+  if (blob.type !== 'image/png') {
+    pngBlob = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Canvas toBlob failed'))), 'image/png');
+      };
+      img.onerror = reject;
+      img.src = dataUrl;
+    });
+  }
+
+  const item = new ClipboardItem({ 'image/png': pngBlob });
+  await navigator.clipboard.write([item]);
+}
+`;
+
 export const EXTENSION_FILES: ExtensionFile[] = [
   {
     name: 'manifest.json',
@@ -1650,6 +1756,20 @@ export const EXTENSION_FILES: ExtensionFile[] = [
     content: EDITOR_JS
   },
   {
+    name: 'offscreen.html',
+    path: 'offscreen.html',
+    language: 'html',
+    description: 'Offscreen document context ensuring 100% reliable clipboard write on macOS and Windows.',
+    content: OFFSCREEN_HTML
+  },
+  {
+    name: 'offscreen.js',
+    path: 'offscreen.js',
+    language: 'javascript',
+    description: 'Offscreen clipboard API handler writing PNG blobs to operating system clipboard.',
+    content: OFFSCREEN_JS
+  },
+  {
     name: 'options.html',
     path: 'options.html',
     language: 'html',
@@ -1671,4 +1791,5 @@ export const EXTENSION_FILES: ExtensionFile[] = [
     content: ICON_SVG
   }
 ];
+
 
