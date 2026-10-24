@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SnapFull Settings</title>
+  <style>
+    body {
+      background: #0b1120;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 24px;
+      max-width: 580px;
+      margin: 0 auto;
+    }
+    h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; color: #f8fafc; }
+    p.sub { font-size: 13px; color: #94a3b8; margin-bottom: 24px; }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+    }
+    .card h2 { font-size: 14px; font-weight: 600; color: #38bdf8; margin-bottom: 12px; }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #293548;
+    }
+    .row:last-child { border-bottom: none; }
+    .label-wrap div:first-child { font-size: 13px; font-weight: 500; }
+    .label-wrap div:last-child { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+    select, input[type="number"] {
+      background: #0f172a;
+      border: 1px solid #475569;
+      color: #f8fafc;
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .save-bar {
+      margin-top: 20px;
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    .btn-save {
+      background: #38bdf8;
+      color: #0f172a;
+      border: none;
+      font-weight: 600;
+      font-size: 13px;
+      padding: 8px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .btn-save:hover { background: #7dd3fc; }
+    #toast { color: #34d399; font-size: 13px; display: none; align-self: center; }
+  </style>
+</head>
+<body>
+  <h1>SnapFull Settings</h1>
+  <p class="sub">Configure screenshot engine, lazy loading, and clipboard options.</p>
+
+  <div class="card">
+    <h2>Capture Engine</h2>
+    <div class="row">
+      <div class="label-wrap">
+        <div>Engine Mode</div>
+        <div>DevTools CDP uses headless viewport override (exact replica of DevTools)</div>
+      </div>
+      <select id="engine">
+        <option value="devtools">DevTools Protocol (CDP - Native Full Size)</option>
+        <option value="stitch">Scroll & Stitch (No debugger banner)</option>
+      </select>
+    </div>
+    <div class="row">
+      <div class="label-wrap">
+        <div>Image Format</div>
+        <div>PNG provides lossless quality; JPEG creates smaller files</div>
+      </div>
+      <select id="format">
+        <option value="png">PNG (Lossless 24-bit)</option>
+        <option value="jpeg">JPEG (Compressed)</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Dynamic & Lazy Loading</h2>
+    <div class="row">
+      <div class="label-wrap">
+        <div>Preload Lazy Content</div>
+        <div>Auto-scrolls page to trigger IntersectionObservers & lazy images</div>
+      </div>
+      <input type="checkbox" id="autoScrollWarmup">
+    </div>
+    <div class="row">
+      <div class="label-wrap">
+        <div>Scroll Step Delay (ms)</div>
+        <div>Time to wait at each viewport step during warmup</div>
+      </div>
+      <input type="number" id="scrollDelayMs" min="50" max="600" step="25" style="width: 80px;">
+    </div>
+    <div class="row">
+      <div class="label-wrap">
+        <div>Hide Fixed/Sticky Navbars</div>
+        <div>Prevents sticky headers from duplicating when stitching</div>
+      </div>
+      <input type="checkbox" id="hideFixedElements">
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Output Actions</h2>
+    <div class="row">
+      <div class="label-wrap">
+        <div>Always Copy to System Clipboard</div>
+        <div>Paste directly into Slack, Figma, Notion, or Docs with Ctrl/Cmd+V</div>
+      </div>
+      <input type="checkbox" id="autoCopyClipboard">
+    </div>
+    <div class="row">
+      <div class="label-wrap">
+        <div>Save to Downloads Folder</div>
+        <div>Automatically download the captured image as a file</div>
+      </div>
+      <input type="checkbox" id="autoDownloadFile">
+    </div>
+  </div>
+
+  <div class="save-bar">
+    <span id="toast">✓ Settings saved!</span>
+    <button class="btn-save" id="saveBtn">Save Preferences</button>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

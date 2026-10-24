@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="lensGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bgGrad)"/>
+  <!-- Camera body -->
+  <path d="M102 96H26C21.6 96 18 92.4 18 88V46C18 41.6 21.6 38 26 38H40L46 28H82L88 38H102C106.4 38 110 41.6 110 46V88C110 92.4 106.4 96 102 96Z" fill="#0f172a" fill-opacity="0.95"/>
+  <!-- Lens outer -->
+  <circle cx="64" cy="65" r="24" fill="url(#lensGrad)" stroke="#38bdf8" stroke-width="4"/>
+  <!-- Lens reflection -->
+  <circle cx="64" cy="65" r="14" fill="#38bdf8" fill-opacity="0.3"/>
+  <circle cx="58" cy="59" r="4" fill="#ffffff" fill-opacity="0.8"/>
+  <!-- Clipboard icon badge in corner -->
+  <g transform="translate(76, 70) scale(0.65)">
+    <rect x="4" y="8" width="36" height="42" rx="6" fill="#38bdf8" stroke="#0f172a" stroke-width="3"/>
+    <rect x="14" y="2" width="16" height="8" rx="3" fill="#0f172a"/>
+    <line x1="12" y1="22" x2="32" y2="22" stroke="#0f172a" stroke-width="3" stroke-linecap="round"/>
+    <line x1="12" y1="30" x2="28" y2="30" stroke="#0f172a" stroke-width="3" stroke-linecap="round"/>
+  </g>
+</svg>

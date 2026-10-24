@@ -10,8 +10,8 @@ export const InstallSteps: React.FC<InstallStepsProps> = ({ onDownloadZip, isDow
   const steps = [
     {
       num: '01',
-      title: 'Download & Unzip Package',
-      desc: 'Click the button below to download the extension zip archive. Unzip it to any folder on your computer (e.g. ~/Downloads/SnapFull).',
+      title: 'Get Extension Files (GitHub or ZIP)',
+      desc: 'If you cloned this repository from GitHub, the extension is inside the "extension" folder! If running via web, click the button below to download the ready-to-load ZIP.',
       icon: Download,
       action: (
         <button
@@ -44,10 +44,15 @@ export const InstallSteps: React.FC<InstallStepsProps> = ({ onDownloadZip, isDow
     },
     {
       num: '04',
-      title: 'Click "Load unpacked"',
-      desc: 'Click the "Load unpacked" button in the top-left toolbar, then select the folder containing manifest.json.',
+      title: 'Click "Load unpacked" & Pick "extension" Folder',
+      desc: 'Click "Load unpacked" in the top-left toolbar, then select the "extension" folder inside this repo (containing manifest.json). Do NOT select the repo root.',
       icon: FolderCheck,
-      badge: 'Instant Activation',
+      badge: 'Pick "extension" Folder',
+      extra: (
+        <div className="mt-2 text-[11px] font-mono bg-slate-950 p-2 rounded-lg text-emerald-400 border border-slate-800">
+          📁 your-repo / <span className="font-bold underline text-white">extension</span> / manifest.json
+        </div>
+      ),
     },
   ];
 
