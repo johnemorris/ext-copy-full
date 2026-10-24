@@ -1,0 +1,6 @@
+{
+  "name": "SnapFull - Full Page Screen Capture to Clipboard Extension",
+  "description": "Chrome DevTools-style full-page screenshot extension for Manifest V3 that automatically copies to clipboard and optionally saves to file, featuring lazy-scroll preloading.",
+  "requestFramePermissions": ["clipboard-read", "clipboard-write"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
