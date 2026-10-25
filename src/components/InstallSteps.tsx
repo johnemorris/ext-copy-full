@@ -101,18 +101,22 @@ export const InstallSteps: React.FC<InstallStepsProps> = ({ onDownloadZip, isDow
           <Check className="w-4 h-4 text-emerald-400" />
           Pro-Tips for Everyday Workflow
         </h4>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-slate-400">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs text-slate-400">
           <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80">
-            <span className="font-semibold text-slate-200 block mb-1">📌 Pin to Toolbar</span>
-            Click the puzzle piece icon in Chrome and click the Pin icon next to SnapFull for instant 1-click access.
+            <span className="font-semibold text-slate-200 block mb-1">🔄 Reloading Changes</span>
+            After git pull or file updates, click the circular reload button (↻) on the SnapFull card in chrome://extensions.
           </div>
           <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80">
-            <span className="font-semibold text-slate-200 block mb-1">⌨️ Custom Keyboard Shortcut</span>
-            Navigate to <code className="text-sky-300 font-mono text-[10px]">chrome://extensions/shortcuts</code> to bind custom keys (e.g. Cmd+Shift+S).
+            <span className="font-semibold text-slate-200 block mb-1">📌 Pin to Toolbar</span>
+            Click the puzzle icon in Chrome and click Pin next to SnapFull for instant 1-click access.
+          </div>
+          <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80">
+            <span className="font-semibold text-slate-200 block mb-1">⌨️ Custom Shortcut</span>
+            Visit <code className="text-sky-300 font-mono text-[10px]">chrome://extensions/shortcuts</code> to bind custom keys (e.g. Cmd+Shift+S).
           </div>
           <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80">
             <span className="font-semibold text-slate-200 block mb-1">🔒 Redact with Blur</span>
-            Use the built-in editor to blur sensitive tokens, client emails, and API keys before copying to clipboard!
+            Use the built-in editor to blur sensitive tokens, client emails, and API keys before sharing!
           </div>
         </div>
       </div>

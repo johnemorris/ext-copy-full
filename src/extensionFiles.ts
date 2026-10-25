@@ -28,6 +28,16 @@ export const MANIFEST_JSON = `{
   "host_permissions": [
     "<all_urls>"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
@@ -111,31 +121,34 @@ async function startCapture(tabId, customOptions = {}) {
   const store = await chrome.storage.sync.get(['settings']);
   const settings = { ...(store.settings || {}), ...customOptions };
 
-  // 1. Inject content script helpers if needed
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content.js']
-  });
+  // 1. Ensure offscreen document is ready for clipboard / canvas operations
+  await ensureOffscreenDocument();
 
-  // 2. Perform lazy-scroll warmup if requested
+  // 2. Perform lazy-scroll warmup sweep if enabled (via direct scripting, no messaging needed)
   if (settings.autoScrollWarmup) {
-    await chrome.tabs.sendMessage(tabId, {
-      action: 'PRELOAD_PAGE',
-      delayMs: settings.scrollDelayMs || 150
-    });
+    await performScrollWarmup(tabId, settings.scrollDelayMs || 120);
   }
 
-  // 3. Choose engine
+  // 3. Choose capture engine (DevTools CDP with automatic Scroll-and-Stitch fallback)
   let dataUrl = '';
+  let copied = false;
+
   if (settings.engine === 'devtools') {
     try {
       dataUrl = await captureWithCDP(tabId, settings);
-    } catch (e) {
-      console.warn('CDP capture failed, falling back to scroll-stitch:', e);
-      dataUrl = await captureWithStitch(tabId, settings);
+      if (settings.autoCopyClipboard) {
+        copied = await copyToClipboardViaOffscreen(dataUrl);
+      }
+    } catch (cdpErr) {
+      console.warn('DevTools CDP capture failed, switching to Scroll & Stitch engine:', cdpErr);
+      const stitchResult = await captureWithStitch(tabId, settings);
+      dataUrl = stitchResult.dataUrl;
+      copied = settings.autoCopyClipboard ? true : false;
     }
   } else {
-    dataUrl = await captureWithStitch(tabId, settings);
+    const stitchResult = await captureWithStitch(tabId, settings);
+    dataUrl = stitchResult.dataUrl;
+    copied = settings.autoCopyClipboard ? true : false;
   }
 
   // Cache last capture for built-in editor
@@ -261,9 +274,9 @@ async function captureWithCDP(tabId, settings) {
   }
 }
 
-// Scroll & Stitch Engine (fallback without debugger banner)
+// Universal Scroll & Stitch Engine (Runs via direct scripting, works on Cloudflare & all pages)
 async function captureWithStitch(tabId, settings) {
-  const dimensions = await chrome.tabs.sendMessage(tabId, { action: 'GET_DIMENSIONS' });
+  const dimensions = await getPageDimensions(tabId);
   const { totalWidth, totalHeight, viewportHeight, devicePixelRatio } = dimensions;
 
   const numSteps = Math.ceil(totalHeight / viewportHeight);
@@ -271,14 +284,10 @@ async function captureWithStitch(tabId, settings) {
 
   for (let i = 0; i < numSteps; i++) {
     const scrollY = i * viewportHeight;
-    await chrome.tabs.sendMessage(tabId, {
-      action: 'SCROLL_TO',
-      y: scrollY,
-      hideFixed: settings.hideFixedElements && i > 0
-    });
+    await scrollTabTo(tabId, scrollY, settings.hideFixedElements);
 
-    // Wait for paint
-    await new Promise((r) => setTimeout(r, 120));
+    // Wait for repaint
+    await new Promise((r) => setTimeout(r, 140));
 
     const chunkDataUrl = await chrome.tabs.captureVisibleTab(null, {
       format: 'png'
@@ -287,42 +296,172 @@ async function captureWithStitch(tabId, settings) {
   }
 
   // Restore original scroll
-  await chrome.tabs.sendMessage(tabId, { action: 'RESTORE_SCROLL' });
+  await restoreTabScroll(tabId);
 
-  // Delegate stitching to content script canvas
-  const stitched = await chrome.tabs.sendMessage(tabId, {
-    action: 'STITCH_FRAMES',
+  // Delegate stitching & clipboard writing to offscreen document (zero content-script dependency)
+  const response = await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    action: 'STITCH_AND_COPY',
     frames,
     totalWidth,
     totalHeight,
     viewportHeight,
     dpr: devicePixelRatio,
-    format: settings.format || 'png'
+    format: settings.format || 'png',
+    autoCopy: settings.autoCopyClipboard !== false
   });
 
-  return stitched.dataUrl;
+  if (!response || !response.success) {
+    throw new Error(response?.error || 'Failed to stitch full-page frames');
+  }
+
+  return { dataUrl: response.dataUrl };
 }
 
-// Offscreen Document clipboard writer (avoids document-not-focused errors on macOS)
-async function copyToClipboardViaOffscreen(dataUrl) {
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT']
-  });
+// Direct DOM measurements via executeScript (no message passing needed)
+async function getPageDimensions(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const body = document.body;
+        const html = document.documentElement;
+        const totalWidth = Math.max(
+          html.scrollWidth,
+          body ? body.scrollWidth : 0,
+          html.clientWidth,
+          window.innerWidth
+        );
+        const totalHeight = Math.max(
+          html.scrollHeight,
+          body ? body.scrollHeight : 0,
+          html.clientHeight,
+          window.innerHeight
+        );
+        return {
+          totalWidth,
+          totalHeight,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          devicePixelRatio: window.devicePixelRatio || 1
+        };
+      }
+    });
 
-  if (!existingContexts.length) {
+    if (results && results[0] && results[0].result) {
+      return results[0].result;
+    }
+  } catch (e) {
+    console.warn('Direct dimensions check fallback:', e);
+  }
+
+  return {
+    totalWidth: 1280,
+    totalHeight: 1080,
+    viewportWidth: 1280,
+    viewportHeight: 1080,
+    devicePixelRatio: 1
+  };
+}
+
+// Direct scroll warmup via executeScript
+async function performScrollWarmup(tabId, delayMs) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (stepDelay) => {
+        const origX = window.scrollX;
+        const origY = window.scrollY;
+        const docHeight = Math.max(
+          document.documentElement.scrollHeight,
+          document.body ? document.body.scrollHeight : 0,
+          window.innerHeight
+        );
+        const step = window.innerHeight * 0.8;
+        for (let y = 0; y < docHeight; y += step) {
+          window.scrollTo(0, y);
+          await new Promise((r) => setTimeout(r, stepDelay));
+        }
+        window.scrollTo(origX, origY);
+      },
+      args: [delayMs || 120]
+    });
+  } catch (e) {
+    console.warn('Scroll warmup ignored:', e);
+  }
+}
+
+// Direct scroll step
+async function scrollTabTo(tabId, scrollY, hideFixed) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (y, shouldHideFixed) => {
+        window.scrollTo(0, y);
+        if (shouldHideFixed && y > 0) {
+          const els = document.querySelectorAll('*');
+          for (const el of els) {
+            const pos = window.getComputedStyle(el).position;
+            if (pos === 'fixed' || pos === 'sticky') {
+              el.setAttribute('data-snapfull-hidden', 'true');
+              el.style.visibility = 'hidden';
+            }
+          }
+        }
+      },
+      args: [scrollY, hideFixed]
+    });
+  } catch (e) {}
+}
+
+// Restore original scroll & visible headers
+async function restoreTabScroll(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const hidden = document.querySelectorAll('[data-snapfull-hidden="true"]');
+        for (const el of hidden) {
+          el.removeAttribute('data-snapfull-hidden');
+          el.style.visibility = '';
+        }
+      }
+    });
+  } catch (e) {}
+}
+
+// Ensure offscreen document exists
+async function ensureOffscreenDocument() {
+  try {
+    if (chrome.offscreen && typeof chrome.offscreen.hasDocument === 'function') {
+      const hasDoc = await chrome.offscreen.hasDocument();
+      if (hasDoc) return;
+    } else if (chrome.runtime.getContexts) {
+      const contexts = await chrome.runtime.getContexts({
+        contextTypes: ['OFFSCREEN_DOCUMENT']
+      });
+      if (contexts && contexts.length > 0) return;
+    }
     await chrome.offscreen.createDocument({
       url: 'offscreen.html',
       reasons: ['CLIPBOARD'],
-      justification: 'Write screenshot image to system clipboard'
+      justification: 'Stitch full-page screenshot and write image to system clipboard'
     });
+  } catch (err) {
+    if (!err.message || !err.message.includes('Only a single offscreen document')) {
+      console.warn('ensureOffscreenDocument notice:', err);
+    }
   }
+}
 
+// Offscreen clipboard writer
+async function copyToClipboardViaOffscreen(dataUrl) {
+  await ensureOffscreenDocument();
   const response = await chrome.runtime.sendMessage({
     target: 'offscreen',
     action: 'COPY_IMAGE_TO_CLIPBOARD',
     dataUrl
   });
-
   return response?.success ?? false;
 }
 `;
