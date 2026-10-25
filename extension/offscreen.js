@@ -54,19 +54,72 @@ function convertBlobToPng(blob) {
   });
 }
 
-// Stitches tiled viewport screenshots into a single full-page image
-async function stitchFrames({ frames, totalWidth, totalHeight, viewportHeight, dpr, format }) {
+// Stitches tiled viewport screenshots into a single seamless full-page image
+async function stitchFrames({ frames, totalWidth, totalHeight, viewportHeight, dpr = 1, format }) {
+  if (!frames || frames.length === 0) {
+    throw new Error('No frames provided for stitching');
+  }
+
+  // Calculate actual canvas pixel height from sliced deltaY if provided
+  let calculatedHeight = 0;
+  const hasDeltaInfo = frames.some((f) => typeof f.deltaY === 'number');
+
+  if (hasDeltaInfo) {
+    for (const frame of frames) {
+      calculatedHeight += frame.deltaY || 0;
+    }
+  }
+  if (!calculatedHeight) {
+    calculatedHeight = totalHeight || viewportHeight || 1080;
+  }
+
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(totalWidth * dpr);
-  canvas.height = Math.round(totalHeight * dpr);
+  canvas.height = Math.round(calculatedHeight * dpr);
   const ctx = canvas.getContext('2d');
 
-  for (const frame of frames) {
+  let currentDestY = 0;
+
+  for (let i = 0; i < frames.length; i++) {
+    const frame = frames[i];
     await new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => {
-        const destY = Math.round(frame.scrollY * dpr);
-        ctx.drawImage(img, 0, destY);
+        const imgWidth = img.width;
+        const imgHeight = img.height;
+
+        if (hasDeltaInfo) {
+          const isFirst = frame.isFirst || i === 0;
+          if (isFirst) {
+            // Draw full first viewport
+            const drawH = Math.min(canvas.height, Math.round((frame.deltaY || viewportHeight) * dpr));
+            ctx.drawImage(img, 0, 0, imgWidth, imgHeight, 0, 0, canvas.width, drawH);
+            currentDestY += drawH;
+          } else {
+            // Seamless slice: only the newly revealed bottom strip of the screen
+            const ratioY = imgHeight / viewportHeight;
+            const sliceHeight = Math.round((frame.deltaY || viewportHeight) * ratioY);
+            const sliceStartY = Math.max(0, imgHeight - sliceHeight);
+            const destH = Math.round((frame.deltaY || viewportHeight) * dpr);
+
+            ctx.drawImage(
+              img,
+              0,
+              sliceStartY,
+              imgWidth,
+              sliceHeight,
+              0,
+              currentDestY,
+              canvas.width,
+              destH
+            );
+            currentDestY += destH;
+          }
+        } else {
+          // Legacy fallback: direct scrollY positioning
+          const destY = Math.round((frame.scrollY || 0) * dpr);
+          ctx.drawImage(img, 0, destY);
+        }
         resolve();
       };
       img.onerror = reject;
@@ -75,7 +128,9 @@ async function stitchFrames({ frames, totalWidth, totalHeight, viewportHeight, d
   }
 
   const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
-  const dataUrl = canvas.toDataURL(mime, 0.92);
+  const quality = format === 'jpeg' ? 0.92 : undefined;
+  const dataUrl = canvas.toDataURL(mime, quality);
 
   return { dataUrl };
 }
+

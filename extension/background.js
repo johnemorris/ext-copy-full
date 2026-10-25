@@ -158,12 +158,10 @@ async function captureWithCDP(tabId, settings) {
     let width = contentSize ? Math.ceil(contentSize.width) : 0;
     let height = contentSize ? Math.ceil(contentSize.height) : 0;
 
-    // Fallback to DOM measurements if metrics are empty
-    if (!width || !height) {
-      const domDim = await getPageDimensions(tabId);
-      width = domDim.totalWidth;
-      height = domDim.totalHeight;
-    }
+    // Complement with DOM measurements to guarantee full content coverage
+    const domDim = await getPageDimensions(tabId);
+    width = Math.max(width || 0, domDim.totalWidth || 0, 1024);
+    height = Math.max(height || 0, domDim.totalHeight || 0, 768);
 
     if (height > 16000) {
       throw new Error('Page height exceeds single CDP GPU texture limit; switching to scroll & stitch');
@@ -203,29 +201,88 @@ async function captureWithCDP(tabId, settings) {
   }
 }
 
-// Universal Scroll & Stitch Engine (Runs via direct scripting, works on Cloudflare & all pages)
+// Universal Scroll & Stitch Engine (Runs via direct scripting, works on Cloudflare, SPAs, and all pages)
 async function captureWithStitch(tabId, settings) {
-  const dimensions = await getPageDimensions(tabId);
-  const { totalWidth, totalHeight, viewportHeight, devicePixelRatio } = dimensions;
+  // 1. Prepare page: inject instant scroll style, identify target, get accurate dimensions
+  const prep = await prepareTabForCapture(tabId);
+  const { totalWidth, totalHeight, viewportHeight, devicePixelRatio, maxScroll } = prep;
 
-  const numSteps = Math.ceil(totalHeight / viewportHeight);
+  // If the page is not scrollable (single screen or very short page)
+  if (maxScroll <= 15 || totalHeight <= viewportHeight + 15) {
+    const chunkDataUrl = await chrome.tabs.captureVisibleTab(null, {
+      format: settings.format || 'png'
+    });
+    await cleanupTabAfterCapture(tabId);
+    return { dataUrl: chunkDataUrl };
+  }
+
   const frames = [];
+  let previousScrollY = 0;
+  let canvasDrawnHeight = viewportHeight;
+  let step = 0;
+  const maxSteps = Math.ceil(totalHeight / (viewportHeight * 0.4)) + 4; // safety threshold
 
-  for (let i = 0; i < numSteps; i++) {
-    const scrollY = i * viewportHeight;
-    await scrollTabTo(tabId, scrollY, settings.hideFixedElements);
+  // Step 0: Ensure we start at the top
+  const initialScroll = await scrollTabTo(tabId, 0, false);
+  await new Promise((r) => setTimeout(r, 140));
 
-    // Wait for repaint
-    await new Promise((r) => setTimeout(r, 140));
+  const firstDataUrl = await chrome.tabs.captureVisibleTab(null, {
+    format: 'png'
+  });
+  frames.push({
+    scrollY: 0,
+    deltaY: viewportHeight,
+    isFirst: true,
+    dataUrl: firstDataUrl
+  });
+
+  previousScrollY = initialScroll.actualY;
+
+  // Step 1..N: Step down until end of document
+  while (canvasDrawnHeight < totalHeight && step < maxSteps) {
+    step++;
+    const targetScrollY = Math.min(previousScrollY + viewportHeight, maxScroll);
+
+    // If target has nowhere to go beyond previous, we are at the bottom
+    if (targetScrollY <= previousScrollY) {
+      break;
+    }
+
+    const scrollResult = await scrollTabTo(tabId, targetScrollY, settings.hideFixedElements);
+
+    // Repaint wait (generous enough for lazy-loaded assets)
+    await new Promise((r) => setTimeout(r, 160));
+
+    const actualY = scrollResult.actualY;
+    const deltaY = actualY - previousScrollY;
+
+    // CRITICAL: If the page didn't actually move down, we reached the bottom or it cannot scroll.
+    // Break immediately to prevent repeating identical frames!
+    if (deltaY <= 0) {
+      break;
+    }
 
     const chunkDataUrl = await chrome.tabs.captureVisibleTab(null, {
       format: 'png'
     });
-    frames.push({ scrollY, dataUrl: chunkDataUrl });
+
+    frames.push({
+      scrollY: actualY,
+      deltaY: deltaY,
+      isFirst: false,
+      dataUrl: chunkDataUrl
+    });
+
+    canvasDrawnHeight += deltaY;
+    previousScrollY = actualY;
+
+    if (actualY >= maxScroll) {
+      break;
+    }
   }
 
-  // Restore original scroll
-  await restoreTabScroll(tabId);
+  // Restore original scroll & visible headers
+  await cleanupTabAfterCapture(tabId);
 
   // Delegate stitching to offscreen document
   const response = await chrome.runtime.sendMessage({
@@ -233,7 +290,7 @@ async function captureWithStitch(tabId, settings) {
     action: 'STITCH_FRAMES',
     frames,
     totalWidth,
-    totalHeight,
+    totalHeight: canvasDrawnHeight,
     viewportHeight,
     dpr: devicePixelRatio,
     format: settings.format || 'png'
@@ -246,7 +303,137 @@ async function captureWithStitch(tabId, settings) {
   return { dataUrl: response.dataUrl };
 }
 
-// Direct DOM measurements via executeScript (no message passing needed)
+// Prepares tab for seamless scroll capture:
+// 1. Injects temporary override for scroll-behavior and CSS transitions to guarantee instant scrolling
+// 2. Identifies the primary scroll container (window or nested overflow element)
+// 3. Reads accurate dimensions and maximum reachable scroll
+async function prepareTabForCapture(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        // 1. Force instant scrolling across all elements
+        if (!document.getElementById('__snapfull_instant_scroll__')) {
+          const style = document.createElement('style');
+          style.id = '__snapfull_instant_scroll__';
+          style.textContent = `
+            html, body, * {
+              scroll-behavior: auto !important;
+              transition-duration: 0.001ms !important;
+              animation-duration: 0.001ms !important;
+            }
+          `;
+          (document.head || document.documentElement).appendChild(style);
+        }
+
+        // 2. Save original scroll positions
+        window.__snapfull_orig_scroll = {
+          x: window.scrollX || window.pageXOffset || 0,
+          y: window.scrollY || window.pageYOffset || 0
+        };
+
+        const doc = document.documentElement;
+        const body = document.body;
+        const se = document.scrollingElement || doc;
+
+        const winScrollHeight = Math.max(
+          se ? se.scrollHeight : 0,
+          doc ? doc.scrollHeight : 0,
+          body ? body.scrollHeight : 0,
+          window.innerHeight
+        );
+
+        const winScrollWidth = Math.max(
+          se ? se.scrollWidth : 0,
+          doc ? doc.scrollWidth : 0,
+          body ? body.scrollWidth : 0,
+          window.innerWidth
+        );
+
+        const winMaxScroll = Math.max(0, winScrollHeight - window.innerHeight);
+
+        // Check if window is genuinely scrollable (> 40px)
+        if (winMaxScroll > 40) {
+          return {
+            isContainer: false,
+            totalWidth: winScrollWidth,
+            totalHeight: winScrollHeight,
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight,
+            devicePixelRatio: window.devicePixelRatio || 1,
+            maxScroll: winMaxScroll
+          };
+        }
+
+        // If window is not scrollable, check for nested scroll containers
+        // Common on SPA layouts, Divi/WordPress builders, flex wrappers with overflow: auto
+        let bestContainer = null;
+        let maxContainerScroll = 0;
+
+        const candidateNodes = document.querySelectorAll('main, #root, #__next, #app, [class*="scroll"], [class*="content"], [class*="wrap"], [id*="wrap"], div, section');
+        for (const el of candidateNodes) {
+          if (el === doc || el === body) continue;
+          const ch = el.clientHeight;
+          const sh = el.scrollHeight;
+          if (ch > 250 && sh > ch + 40) {
+            const style = window.getComputedStyle(el);
+            const oy = style.overflowY;
+            if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') {
+              const scrollable = sh - ch;
+              if (scrollable > maxContainerScroll) {
+                maxContainerScroll = scrollable;
+                bestContainer = el;
+              }
+            }
+          }
+        }
+
+        if (bestContainer) {
+          bestContainer.setAttribute('data-snapfull-scroll-container', 'true');
+          window.__snapfull_orig_container_scroll = bestContainer.scrollTop;
+          return {
+            isContainer: true,
+            totalWidth: Math.max(bestContainer.scrollWidth, window.innerWidth),
+            totalHeight: bestContainer.scrollHeight,
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight,
+            devicePixelRatio: window.devicePixelRatio || 1,
+            maxScroll: maxContainerScroll
+          };
+        }
+
+        // Fallback to window dimensions
+        return {
+          isContainer: false,
+          totalWidth: winScrollWidth,
+          totalHeight: winScrollHeight,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          devicePixelRatio: window.devicePixelRatio || 1,
+          maxScroll: winMaxScroll
+        };
+      }
+    });
+
+    if (results && results[0] && results[0].result) {
+      return results[0].result;
+    }
+  } catch (err) {
+    console.warn('prepareTabForCapture error:', err);
+  }
+
+  return {
+    isContainer: false,
+    totalWidth: 1280,
+    totalHeight: 1080,
+    viewportWidth: 1280,
+    viewportHeight: 1080,
+    devicePixelRatio: 1,
+    maxScroll: 0
+  };
+}
+
+// Direct DOM measurements via executeScript
 async function getPageDimensions(tabId) {
   try {
     const results = await chrome.scripting.executeScript({
@@ -254,13 +441,16 @@ async function getPageDimensions(tabId) {
       func: () => {
         const body = document.body;
         const html = document.documentElement;
+        const se = document.scrollingElement || html;
         const totalWidth = Math.max(
+          se ? se.scrollWidth : 0,
           html.scrollWidth,
           body ? body.scrollWidth : 0,
           html.clientWidth,
           window.innerWidth
         );
         const totalHeight = Math.max(
+          se ? se.scrollHeight : 0,
           html.scrollHeight,
           body ? body.scrollHeight : 0,
           html.clientHeight,
@@ -307,10 +497,10 @@ async function performScrollWarmup(tabId, delayMs) {
         );
         const step = window.innerHeight * 0.8;
         for (let y = 0; y < docHeight; y += step) {
-          window.scrollTo(0, y);
+          window.scrollTo({ top: y, behavior: 'instant' });
           await new Promise((r) => setTimeout(r, stepDelay));
         }
-        window.scrollTo(origX, origY);
+        window.scrollTo({ top: origY, left: origX, behavior: 'instant' });
       },
       args: [delayMs || 120]
     });
@@ -319,44 +509,108 @@ async function performScrollWarmup(tabId, delayMs) {
   }
 }
 
-// Direct scroll step
+// Direct scroll step: scrolls window and/or active container, and returns actual reached scroll position
 async function scrollTabTo(tabId, scrollY, hideFixed) {
   try {
-    await chrome.scripting.executeScript({
+    const results = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (y, shouldHideFixed) => {
-        window.scrollTo(0, y);
-        if (shouldHideFixed && y > 0) {
-          const els = document.querySelectorAll('*');
-          for (const el of els) {
-            const pos = window.getComputedStyle(el).position;
-            if (pos === 'fixed' || pos === 'sticky') {
-              el.setAttribute('data-snapfull-hidden', 'true');
-              el.style.visibility = 'hidden';
+      func: (targetY, shouldHideFixed) => {
+        // 1. Scroll window and document elements
+        window.scrollTo({ top: targetY, left: 0, behavior: 'instant' });
+        if (document.scrollingElement) {
+          document.scrollingElement.scrollTop = targetY;
+        }
+        if (document.documentElement) {
+          document.documentElement.scrollTop = targetY;
+        }
+        if (document.body) {
+          document.body.scrollTop = targetY;
+        }
+
+        // 2. Also scroll container if marked
+        const container = document.querySelector('[data-snapfull-scroll-container="true"]');
+        if (container) {
+          container.scrollTop = targetY;
+        }
+
+        // 3. Measure actual scroll position achieved
+        const docY = window.scrollY || window.pageYOffset || 0;
+        const seY = document.scrollingElement ? document.scrollingElement.scrollTop : 0;
+        const contY = container ? container.scrollTop : 0;
+        const actualY = Math.max(docY, seY, contY);
+
+        // 4. Optionally hide fixed / sticky elements when scrolled past top to prevent ghosting
+        if (shouldHideFixed && actualY > 0) {
+          const allEls = document.querySelectorAll('*');
+          for (const el of allEls) {
+            if (!el.getAttribute('data-snapfull-fixed-processed')) {
+              const style = window.getComputedStyle(el);
+              const pos = style.position;
+              if (pos === 'fixed' || pos === 'sticky') {
+                el.setAttribute('data-snapfull-fixed-processed', 'true');
+                el.setAttribute('data-snapfull-orig-visibility', el.style.visibility || '');
+                el.style.visibility = 'hidden';
+              }
             }
           }
         }
+
+        return { actualY };
       },
       args: [scrollY, hideFixed]
     });
-  } catch (e) {}
+
+    if (results && results[0] && results[0].result) {
+      return results[0].result;
+    }
+  } catch (e) {
+    console.warn('scrollTabTo error:', e);
+  }
+
+  return { actualY: scrollY };
 }
 
-// Restore original scroll & visible headers
-async function restoreTabScroll(tabId) {
+// Cleans up injected styles, restores scroll position, and unhides fixed elements
+async function cleanupTabAfterCapture(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
-        const hidden = document.querySelectorAll('[data-snapfull-hidden="true"]');
-        for (const el of hidden) {
-          el.removeAttribute('data-snapfull-hidden');
-          el.style.visibility = '';
+        // Remove style override
+        const style = document.getElementById('__snapfull_instant_scroll__');
+        if (style) style.remove();
+
+        // Restore window scroll
+        if (window.__snapfull_orig_scroll) {
+          window.scrollTo(window.__snapfull_orig_scroll.x, window.__snapfull_orig_scroll.y);
+          delete window.__snapfull_orig_scroll;
+        }
+
+        // Restore container scroll
+        const container = document.querySelector('[data-snapfull-scroll-container="true"]');
+        if (container) {
+          if (typeof window.__snapfull_orig_container_scroll === 'number') {
+            container.scrollTop = window.__snapfull_orig_container_scroll;
+            delete window.__snapfull_orig_container_scroll;
+          }
+          container.removeAttribute('data-snapfull-scroll-container');
+        }
+
+        // Restore visibility of fixed / sticky elements
+        const hiddenEls = document.querySelectorAll('[data-snapfull-fixed-processed="true"]');
+        for (const el of hiddenEls) {
+          const orig = el.getAttribute('data-snapfull-orig-visibility');
+          el.style.visibility = orig || '';
+          el.removeAttribute('data-snapfull-fixed-processed');
+          el.removeAttribute('data-snapfull-orig-visibility');
         }
       }
     });
-  } catch (e) {}
+  } catch (e) {
+    console.warn('cleanupTabAfterCapture notice:', e);
+  }
 }
+
 
 // Ensure offscreen document exists
 async function ensureOffscreenDocument() {
