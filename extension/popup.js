@@ -71,17 +71,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         throw new Error('Chrome restricts extensions on internal chrome:// or extension store pages. Please test on any regular website (e.g. github.com, wikipedia.org, google.com).');
       }
 
+      const { settings = {} } = await chrome.storage.sync.get(['settings']);
+      const activeEngine = settings.engine || 'devtools';
+
       chrome.runtime.sendMessage(
         {
           action: 'START_CAPTURE',
           tabId: tab.id,
           options: {
+            engine: activeEngine,
             autoCopyClipboard: toggleClipboard.checked,
             autoDownloadFile: toggleDownload.checked,
             autoScrollWarmup: toggleWarmup.checked,
             openEditor: forceOpenEditor || toggleEditor.checked
           }
         },
+
         async (response) => {
           btnCapture.disabled = false;
           if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = false;

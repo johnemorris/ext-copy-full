@@ -60,7 +60,11 @@ async function stitchFrames({ frames, totalWidth, totalHeight, viewportHeight, d
     throw new Error('No frames provided for stitching');
   }
 
-  // Calculate actual canvas pixel height from sliced deltaY if provided
+  // Fast-path: single frame needs no canvas operations
+  if (frames.length === 1) {
+    return { dataUrl: frames[0].dataUrl };
+  }
+
   let calculatedHeight = 0;
   const hasDeltaInfo = frames.some((f) => typeof f.deltaY === 'number');
 
