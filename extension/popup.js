@@ -82,7 +82,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             openEditor: forceOpenEditor || toggleEditor.checked
           }
         },
-        (response) => {
+        async (response) => {
           btnCapture.disabled = false;
           if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = false;
 
@@ -93,9 +93,27 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
 
           if (response && response.success) {
+            // Direct popup clipboard write (popup has active window focus on macOS)
+            if (toggleClipboard.checked && response.result?.dataUrl) {
+              try {
+                const parts = response.result.dataUrl.split(',');
+                const bstr = atob(parts[1]);
+                let n = bstr.length;
+                const u8arr = new Uint8Array(n);
+                while (n--) {
+                  u8arr[n] = bstr.charCodeAt(n);
+                }
+                const blob = new Blob([u8arr], { type: 'image/png' });
+                const item = new ClipboardItem({ 'image/png': blob });
+                await navigator.clipboard.write([item]);
+              } catch (clipErr) {
+                console.warn('Popup clipboard write notice:', clipErr);
+              }
+            }
+
             statusBox.innerHTML = '<strong>✓ Full Page Captured!</strong><br><span style="font-size:10px;">Copied to clipboard. Press Cmd+V to paste.</span>';
             statusBox.className = 'status-msg success';
-            setTimeout(() => window.close(), 2400);
+            setTimeout(() => window.close(), 2200);
           } else {
             statusBox.textContent = '⚠️ ' + (response?.error || 'Capture failed');
             statusBox.className = 'status-msg error';

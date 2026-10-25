@@ -12,8 +12,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async
   }
 
-  if (message.action === 'STITCH_AND_COPY') {
-    stitchFramesAndCopy(message)
+  if (message.action === 'STITCH_FRAMES' || message.action === 'STITCH_AND_COPY') {
+    stitchFrames(message)
       .then((res) => sendResponse({ success: true, dataUrl: res.dataUrl }))
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true; // async
@@ -54,8 +54,8 @@ function convertBlobToPng(blob) {
   });
 }
 
-// Stitches tiled viewport screenshots into a single full-page image and copies to clipboard
-async function stitchFramesAndCopy({ frames, totalWidth, totalHeight, viewportHeight, dpr, format, autoCopy }) {
+// Stitches tiled viewport screenshots into a single full-page image
+async function stitchFrames({ frames, totalWidth, totalHeight, viewportHeight, dpr, format }) {
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(totalWidth * dpr);
   canvas.height = Math.round(totalHeight * dpr);
@@ -76,28 +76,6 @@ async function stitchFramesAndCopy({ frames, totalWidth, totalHeight, viewportHe
 
   const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
   const dataUrl = canvas.toDataURL(mime, 0.92);
-
-  if (autoCopy !== false) {
-    await new Promise((resolve, reject) => {
-      canvas.toBlob(async (blob) => {
-        if (!blob) {
-          reject(new Error('Canvas toBlob failed during stitch'));
-          return;
-        }
-        try {
-          let pngBlob = blob;
-          if (blob.type !== 'image/png') {
-            pngBlob = await convertBlobToPng(blob);
-          }
-          const item = new ClipboardItem({ 'image/png': pngBlob });
-          await navigator.clipboard.write([item]);
-          resolve();
-        } catch (clipErr) {
-          reject(clipErr);
-        }
-      }, 'image/png');
-    });
-  }
 
   return { dataUrl };
 }

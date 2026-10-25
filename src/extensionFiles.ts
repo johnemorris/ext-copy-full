@@ -136,41 +136,23 @@ async function startCapture(tabId, customOptions = {}) {
   if (settings.engine === 'devtools') {
     try {
       dataUrl = await captureWithCDP(tabId, settings);
-      if (settings.autoCopyClipboard) {
-        copied = await copyToClipboardViaOffscreen(dataUrl);
-      }
     } catch (cdpErr) {
       console.warn('DevTools CDP capture failed, switching to Scroll & Stitch engine:', cdpErr);
       const stitchResult = await captureWithStitch(tabId, settings);
       dataUrl = stitchResult.dataUrl;
-      copied = settings.autoCopyClipboard ? true : false;
     }
   } else {
     const stitchResult = await captureWithStitch(tabId, settings);
     dataUrl = stitchResult.dataUrl;
-    copied = settings.autoCopyClipboard ? true : false;
   }
 
-  // Cache last capture for built-in editor
-  await chrome.storage.local.set({ lastCaptureDataUrl: dataUrl });
+  if (!dataUrl) {
+    throw new Error('Screenshot capture produced an empty image.');
+  }
 
-  // 5. Copy image to system clipboard (primary: Offscreen API; fallback: Content script)
-  let copied = false;
+  // Copy to clipboard with active tab focus
   if (settings.autoCopyClipboard) {
-    try {
-      copied = await copyToClipboardViaOffscreen(dataUrl);
-    } catch (offscreenErr) {
-      console.warn('Offscreen clipboard write failed, trying content script fallback:', offscreenErr);
-      try {
-        const copyResult = await chrome.tabs.sendMessage(tabId, {
-          action: 'COPY_TO_CLIPBOARD',
-          dataUrl
-        });
-        copied = copyResult?.success ?? false;
-      } catch (contentErr) {
-        console.error('All clipboard write attempts failed:', contentErr);
-      }
-    }
+    copied = await writeImageToClipboard(tabId, dataUrl);
   }
 
   // 6. Optionally save to file
@@ -298,17 +280,16 @@ async function captureWithStitch(tabId, settings) {
   // Restore original scroll
   await restoreTabScroll(tabId);
 
-  // Delegate stitching & clipboard writing to offscreen document (zero content-script dependency)
+  // Delegate stitching to offscreen document
   const response = await chrome.runtime.sendMessage({
     target: 'offscreen',
-    action: 'STITCH_AND_COPY',
+    action: 'STITCH_FRAMES',
     frames,
     totalWidth,
     totalHeight,
     viewportHeight,
     dpr: devicePixelRatio,
-    format: settings.format || 'png',
-    autoCopy: settings.autoCopyClipboard !== false
+    format: settings.format || 'png'
   });
 
   if (!response || !response.success) {
@@ -454,15 +435,73 @@ async function ensureOffscreenDocument() {
   }
 }
 
-// Offscreen clipboard writer
-async function copyToClipboardViaOffscreen(dataUrl) {
-  await ensureOffscreenDocument();
-  const response = await chrome.runtime.sendMessage({
-    target: 'offscreen',
-    action: 'COPY_IMAGE_TO_CLIPBOARD',
-    dataUrl
-  });
-  return response?.success ?? false;
+// Writes image directly to macOS/Windows clipboard using active tab document focus
+async function writeImageToClipboard(tabId, dataUrl) {
+  // Strategy 1: Active Tab execution (Guarantees document focus required by macOS)
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [dataUrl],
+      func: async (url) => {
+        try {
+          window.focus();
+          // Pure JS base64 to Blob conversion (safe from CSP connect-src blocks)
+          const parts = url.split(',');
+          const mimeMatch = parts[0].match(/:(.*?);/);
+          const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+          const bstr = atob(parts[1]);
+          let n = bstr.length;
+          const u8arr = new Uint8Array(n);
+          while (n--) {
+            u8arr[n] = bstr.charCodeAt(n);
+          }
+          let pngBlob = new Blob([u8arr], { type: mime });
+
+          // Guarantee PNG MIME for OS clipboard
+          if (mime !== 'image/png') {
+            pngBlob = await new Promise((resolve, reject) => {
+              const img = new Image();
+              img.onload = () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Canvas blob failed'))), 'image/png');
+              };
+              img.onerror = reject;
+              img.src = url;
+            });
+          }
+
+          const item = new ClipboardItem({ 'image/png': pngBlob });
+          await navigator.clipboard.write([item]);
+          return { success: true };
+        } catch (err) {
+          return { success: false, error: err.message };
+        }
+      }
+    });
+
+    if (results && results[0]?.result?.success) {
+      return true;
+    }
+  } catch (err) {
+    console.warn('Tab clipboard write notice:', err);
+  }
+
+  // Strategy 2: Offscreen fallback
+  try {
+    await ensureOffscreenDocument();
+    const response = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'COPY_IMAGE_TO_CLIPBOARD',
+      dataUrl
+    });
+    if (response?.success) return true;
+  } catch (_) {}
+
+  return false;
 }
 `;
 
@@ -1123,7 +1162,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             openEditor: forceOpenEditor || toggleEditor.checked
           }
         },
-        (response) => {
+        async (response) => {
           btnCapture.disabled = false;
           if (btnCaptureAndEdit) btnCaptureAndEdit.disabled = false;
 
@@ -1134,9 +1173,27 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
 
           if (response && response.success) {
+            // Direct popup clipboard write (popup has active window focus on macOS)
+            if (toggleClipboard.checked && response.result?.dataUrl) {
+              try {
+                const parts = response.result.dataUrl.split(',');
+                const bstr = atob(parts[1]);
+                let n = bstr.length;
+                const u8arr = new Uint8Array(n);
+                while (n--) {
+                  u8arr[n] = bstr.charCodeAt(n);
+                }
+                const blob = new Blob([u8arr], { type: 'image/png' });
+                const item = new ClipboardItem({ 'image/png': blob });
+                await navigator.clipboard.write([item]);
+              } catch (clipErr) {
+                console.warn('Popup clipboard write notice:', clipErr);
+              }
+            }
+
             statusBox.innerHTML = '<strong>✓ Full Page Captured!</strong><br><span style="font-size:10px;">Copied to clipboard. Press Cmd+V to paste.</span>';
             statusBox.className = 'status-msg success';
-            setTimeout(() => window.close(), 2400);
+            setTimeout(() => window.close(), 2200);
           } else {
             statusBox.textContent = '⚠️ ' + (response?.error || 'Capture failed');
             statusBox.className = 'status-msg error';
@@ -1808,11 +1865,22 @@ export const OFFSCREEN_HTML = `<!DOCTYPE html>
 <body></body>
 </html>`;
 
-export const OFFSCREEN_JS = `// Offscreen document script for reliable clipboard writes in Chrome Manifest V3
+export const OFFSCREEN_JS = `// Offscreen document script for SnapFull
+// Handles canvas stitching and reliable clipboard writing in Chrome Manifest V3
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.target === 'offscreen' && message.action === 'COPY_IMAGE_TO_CLIPBOARD') {
+  if (message.target !== 'offscreen') return;
+
+  if (message.action === 'COPY_IMAGE_TO_CLIPBOARD') {
     copyDataUrlToClipboard(message.dataUrl)
       .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true; // async
+  }
+
+  if (message.action === 'STITCH_FRAMES' || message.action === 'STITCH_AND_COPY') {
+    stitchFrames(message)
+      .then((res) => sendResponse({ success: true, dataUrl: res.dataUrl }))
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true; // async
   }
@@ -1824,23 +1892,58 @@ async function copyDataUrlToClipboard(dataUrl) {
 
   let pngBlob = blob;
   if (blob.type !== 'image/png') {
-    pngBlob = await new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0);
-        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Canvas toBlob failed'))), 'image/png');
-      };
-      img.onerror = reject;
-      img.src = dataUrl;
-    });
+    pngBlob = await convertBlobToPng(blob);
   }
 
   const item = new ClipboardItem({ 'image/png': pngBlob });
   await navigator.clipboard.write([item]);
+}
+
+function convertBlobToPng(blob) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Canvas toBlob failed'))), 'image/png');
+    };
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(e);
+    };
+    img.src = url;
+  });
+}
+
+// Stitches tiled viewport screenshots into a single full-page image
+async function stitchFrames({ frames, totalWidth, totalHeight, viewportHeight, dpr, format }) {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(totalWidth * dpr);
+  canvas.height = Math.round(totalHeight * dpr);
+  const ctx = canvas.getContext('2d');
+
+  for (const frame of frames) {
+    await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const destY = Math.round(frame.scrollY * dpr);
+        ctx.drawImage(img, 0, destY);
+        resolve();
+      };
+      img.onerror = reject;
+      img.src = frame.dataUrl;
+    });
+  }
+
+  const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const dataUrl = canvas.toDataURL(mime, 0.92);
+
+  return { dataUrl };
 }
 `;
 

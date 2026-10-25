@@ -69,25 +69,25 @@ async function startCapture(tabId, customOptions = {}) {
   if (settings.engine === 'devtools') {
     try {
       dataUrl = await captureWithCDP(tabId, settings);
-      // Copy CDP screenshot via offscreen document
-      if (settings.autoCopyClipboard) {
-        copied = await copyToClipboardViaOffscreen(dataUrl);
-      }
     } catch (cdpErr) {
       console.warn('DevTools CDP capture failed, switching to Scroll & Stitch engine:', cdpErr);
       const stitchResult = await captureWithStitch(tabId, settings);
       dataUrl = stitchResult.dataUrl;
-      copied = settings.autoCopyClipboard ? true : false;
     }
   } else {
     const stitchResult = await captureWithStitch(tabId, settings);
     dataUrl = stitchResult.dataUrl;
-    copied = settings.autoCopyClipboard ? true : false;
   }
 
   if (!dataUrl) {
     throw new Error('Screenshot capture produced an empty image.');
   }
+
+  // Copy to clipboard with active tab focus
+  if (settings.autoCopyClipboard) {
+    copied = await writeImageToClipboard(tabId, dataUrl);
+  }
+
 
   // 4. Cache last capture for built-in editor
   await chrome.storage.local.set({ lastCaptureDataUrl: dataUrl });
@@ -227,17 +227,16 @@ async function captureWithStitch(tabId, settings) {
   // Restore original scroll
   await restoreTabScroll(tabId);
 
-  // Delegate stitching & clipboard writing to offscreen document (zero content-script dependency)
+  // Delegate stitching to offscreen document
   const response = await chrome.runtime.sendMessage({
     target: 'offscreen',
-    action: 'STITCH_AND_COPY',
+    action: 'STITCH_FRAMES',
     frames,
     totalWidth,
     totalHeight,
     viewportHeight,
     dpr: devicePixelRatio,
-    format: settings.format || 'png',
-    autoCopy: settings.autoCopyClipboard !== false
+    format: settings.format || 'png'
   });
 
   if (!response || !response.success) {
@@ -383,13 +382,71 @@ async function ensureOffscreenDocument() {
   }
 }
 
-// Offscreen clipboard writer
-async function copyToClipboardViaOffscreen(dataUrl) {
-  await ensureOffscreenDocument();
-  const response = await chrome.runtime.sendMessage({
-    target: 'offscreen',
-    action: 'COPY_IMAGE_TO_CLIPBOARD',
-    dataUrl
-  });
-  return response?.success ?? false;
+// Writes image directly to macOS/Windows clipboard using active tab document focus
+async function writeImageToClipboard(tabId, dataUrl) {
+  // Strategy 1: Active Tab execution (Guarantees document focus required by macOS)
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [dataUrl],
+      func: async (url) => {
+        try {
+          window.focus();
+          // Pure JS base64 to Blob conversion (safe from CSP connect-src blocks)
+          const parts = url.split(',');
+          const mimeMatch = parts[0].match(/:(.*?);/);
+          const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+          const bstr = atob(parts[1]);
+          let n = bstr.length;
+          const u8arr = new Uint8Array(n);
+          while (n--) {
+            u8arr[n] = bstr.charCodeAt(n);
+          }
+          let pngBlob = new Blob([u8arr], { type: mime });
+
+          // Guarantee PNG MIME for OS clipboard
+          if (mime !== 'image/png') {
+            pngBlob = await new Promise((resolve, reject) => {
+              const img = new Image();
+              img.onload = () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Canvas blob failed'))), 'image/png');
+              };
+              img.onerror = reject;
+              img.src = url;
+            });
+          }
+
+          const item = new ClipboardItem({ 'image/png': pngBlob });
+          await navigator.clipboard.write([item]);
+          return { success: true };
+        } catch (err) {
+          return { success: false, error: err.message };
+        }
+      }
+    });
+
+    if (results && results[0]?.result?.success) {
+      return true;
+    }
+  } catch (err) {
+    console.warn('Tab clipboard write notice:', err);
+  }
+
+  // Strategy 2: Offscreen fallback
+  try {
+    await ensureOffscreenDocument();
+    const response = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'COPY_IMAGE_TO_CLIPBOARD',
+      dataUrl
+    });
+    if (response?.success) return true;
+  } catch (_) {}
+
+  return false;
 }
